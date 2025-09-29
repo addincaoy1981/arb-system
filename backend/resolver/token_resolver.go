@@ -63,7 +63,14 @@ func GetTokenMeta(client *ethclient.Client, addr string) *TokenMeta {
 	cacheMu.RUnlock()
 
 	// 从 Redis 取
-	if meta := redis.GetTokenMeta(addr); meta != nil {
+	redisMeta := redis.GetTokenMeta(addr)
+	if redisMeta != nil {
+		meta := &TokenMeta{
+			Address:  redisMeta.Address,
+			Symbol:   redisMeta.Symbol,
+			Name:     redisMeta.Name,
+			Decimals: redisMeta.Decimals,
+		}
 		cacheMu.Lock()
 		tokenCache[addr] = meta
 		cacheMu.Unlock()
@@ -71,7 +78,7 @@ func GetTokenMeta(client *ethclient.Client, addr string) *TokenMeta {
 	}
 
 	// 链上读取
-	meta, err := fetchFromChain(client, addr)
+	newMeta, err := fetchFromChain(client, addr)
 	if err != nil {
 		log.Printf("fetch token meta failed for %s: %v", addr, err)
 		return nil
@@ -79,11 +86,18 @@ func GetTokenMeta(client *ethclient.Client, addr string) *TokenMeta {
 
 	// 存缓存 & Redis
 	cacheMu.Lock()
-	tokenCache[addr] = meta
+	tokenCache[addr] = newMeta
 	cacheMu.Unlock()
-	redis.SetTokenMeta(addr, meta)
 
-	return meta
+	redisMeta = &redis.TokenMeta{
+		Address:  newMeta.Address,
+		Symbol:   newMeta.Symbol,
+		Name:     newMeta.Name,
+		Decimals: newMeta.Decimals,
+	}
+	redis.SetTokenMeta(addr, redisMeta)
+
+	return newMeta
 }
 
 // fetchFromChain 从链上获取 ERC20 信息
@@ -200,11 +214,34 @@ func BatchFetchTokenMeta(client *ethclient.Client, tokens []common.Address) ([]*
 		cacheMu.Lock()
 		tokenCache[meta.Address] = meta
 		cacheMu.Unlock()
-		redis.SetTokenMeta(meta.Address, meta)
+
+		redisMeta := &redis.TokenMeta{
+			Address:  meta.Address,
+			Symbol:   meta.Symbol,
+			Name:     meta.Name,
+			Decimals: meta.Decimals,
+		}
+		redis.SetTokenMeta(meta.Address, redisMeta)
 
 		metas = append(metas, meta)
 	}
 	return metas, nil
+}
+
+// BatchFetchAccountBalances 批量获取账户余额
+func BatchFetchAccountBalances(client *ethclient.Client, accounts []common.Address) ([]*big.Int, error) {
+	balances := []*big.Int{}
+	for _, account := range accounts {
+		balance, err := client.BalanceAt(context.Background(), account, nil)
+		if err != nil {
+			log.Printf("Failed to get balance for account %s: %v", account.Hex(), err)
+			balances = append(balances, big.NewInt(0))
+		} else {
+			balances = append(balances, balance)
+		}
+	}
+
+	return balances, nil
 }
 
 // -------------------- 后台刷新 --------------------
@@ -235,4 +272,145 @@ func StartBackgroundRefresh(client *ethclient.Client, interval time.Duration) {
 			}
 		}
 	}()
+}
+
+// GetTokenPriceInETH 获取 Token 的 ETH 价格
+func GetTokenPriceInETH(tokenAddr string) *big.Float {
+	// 稳定币 → 直接返回 1/ETH (即 USD/ETH 的倒数)
+	if strings.Contains(strings.ToLower(tokenAddr), "usdt") ||
+		strings.Contains(strings.ToLower(tokenAddr), "usdc") ||
+		strings.Contains(strings.ToLower(tokenAddr), "dai") {
+		// 假设有 ETH/USD 价格，可以从 Redis 或 TokenGraph 拿
+		ethPriceUSD := 1800.0 // TODO: 替换成真实 ETH/USD 价格来源
+		return big.NewFloat(1.0 / ethPriceUSD)
+	}
+
+	// 其他 Token 走 TokenGraph
+	// 注意：由于循环依赖，我们不能直接引用graph包
+	// 这里应该通过其他方式获取汇率信息
+	return big.NewFloat(0) // 没有价格
+}
+
+// -------------------- 池子元数据解析 --------------------
+
+type PoolMetadata struct {
+	Address      string  `json:"address"`
+	Token0       string  `json:"token0"`
+	Token1       string  `json:"token1"`
+	Token0Symbol string  `json:"token0_symbol"`
+	Token1Symbol string  `json:"token1_symbol"`
+	Decimals0    uint8   `json:"decimals0"`
+	Decimals1    uint8   `json:"decimals1"`
+	SizeETH      float64 `json:"size_eth"`
+	Approved     bool    `json:"approved"`
+}
+
+// ResolvePoolMetadata 使用 Multicall 一次性获取池子元数据
+func ResolvePoolMetadata(client *ethclient.Client, poolAddr string, token0Addr string, token1Addr string) *PoolMetadata {
+	ctx := context.Background()
+	pool := common.HexToAddress(poolAddr)
+
+	// 1. 如果没传 token0/token1 地址，从池子里取
+	if token0Addr == "" || token1Addr == "" {
+		token0Addr, token1Addr = fetchPoolTokens(ctx, client, pool)
+		if token0Addr == "" || token1Addr == "" {
+			log.Printf("ResolvePoolMetadata: fetchPoolTokens failed for %s", poolAddr)
+			return nil
+		}
+	}
+
+	// 2. 批量获取 token0/token1 的 meta
+	tokens := []common.Address{common.HexToAddress(token0Addr), common.HexToAddress(token1Addr)}
+	metas, err := BatchFetchTokenMeta(client, tokens)
+	if err != nil || len(metas) != 2 {
+		log.Printf("ResolvePoolMetadata: BatchFetchTokenMeta failed for %s", poolAddr)
+		return nil
+	}
+	meta0, meta1 := metas[0], metas[1]
+
+	// 3. 获取 reserves
+	res0, res1 := fetchPoolReserves(ctx, client, pool)
+
+	// 4. 计算池子大小 (USD 占位，需要结合你已有的价格模块)
+	sizeETH := calcPoolSizeETH(meta0, meta1, res0, res1)
+
+	// 5. 返回 PoolMetadata
+	return &PoolMetadata{
+		Address:      poolAddr,
+		Token0:       token0Addr,
+		Token1:       token1Addr,
+		Token0Symbol: meta0.Symbol,
+		Token1Symbol: meta1.Symbol,
+		Decimals0:    meta0.Decimals,
+		Decimals1:    meta1.Decimals,
+		SizeETH:      sizeETH,
+		Approved:     false,
+	}
+}
+
+// fetchPoolTokens 调用池子 token0()/token1()
+func fetchPoolTokens(ctx context.Context, client *ethclient.Client, pool common.Address) (string, string) {
+	poolABIJson := `[{"inputs":[],"name":"token0","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},
+	{"inputs":[],"name":"token1","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"}]`
+	poolABI, _ := abi.JSON(strings.NewReader(poolABIJson))
+
+	// token0()
+	data0, _ := poolABI.Pack("token0")
+	out0, err := client.CallContract(ctx, ethereum.CallMsg{To: &pool, Data: data0}, nil)
+	if err != nil || len(out0) == 0 {
+		return "", ""
+	}
+	token0, _ := poolABI.Methods["token0"].Outputs.Unpack(out0)
+
+	// token1()
+	data1, _ := poolABI.Pack("token1")
+	out1, err := client.CallContract(ctx, ethereum.CallMsg{To: &pool, Data: data1}, nil)
+	if err != nil || len(out1) == 0 {
+		return "", ""
+	}
+	token1, _ := poolABI.Methods["token1"].Outputs.Unpack(out1)
+
+	return token0[0].(common.Address).Hex(), token1[0].(common.Address).Hex()
+}
+
+// fetchPoolReserves 调用 getReserves()
+func fetchPoolReserves(ctx context.Context, client *ethclient.Client, pool common.Address) (*big.Int, *big.Int) {
+	poolABIJson := `[{"inputs":[],"name":"getReserves","outputs":[{"internalType":"uint112","name":"reserve0","type":"uint112"},
+	{"internalType":"uint112","name":"reserve1","type":"uint112"},
+	{"internalType":"uint32","name":"blockTimestampLast","type":"uint32"}],"stateMutability":"view","type":"function"}]`
+	poolABI, _ := abi.JSON(strings.NewReader(poolABIJson))
+
+	data, _ := poolABI.Pack("getReserves")
+	out, err := client.CallContract(ctx, ethereum.CallMsg{To: &pool, Data: data}, nil)
+	if err != nil || len(out) == 0 {
+		return big.NewInt(0), big.NewInt(0)
+	}
+	res, _ := poolABI.Methods["getReserves"].Outputs.Unpack(out)
+	return res[0].(*big.Int), res[1].(*big.Int)
+}
+
+// calcPoolSizeETH 计算池子规模 (以 ETH 计价)
+func calcPoolSizeETH(meta0 *TokenMeta, meta1 *TokenMeta, res0 *big.Int, res1 *big.Int) float64 {
+	// 转换成 float
+	f0 := new(big.Float).SetInt(res0)
+	f1 := new(big.Float).SetInt(res1)
+
+	// 考虑 decimals
+	dec0 := new(big.Float).SetInt(new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(meta0.Decimals)), nil))
+	dec1 := new(big.Float).SetInt(new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(meta1.Decimals)), nil))
+
+	normalized0 := new(big.Float).Quo(f0, dec0)
+	normalized1 := new(big.Float).Quo(f1, dec1)
+
+	// 获取 Token 的 ETH 价格
+	price0ETH := GetTokenPriceInETH(meta0.Address)
+	price1ETH := GetTokenPriceInETH(meta1.Address)
+
+	// 计算池子价值 (ETH)
+	v0 := new(big.Float).Mul(normalized0, price0ETH)
+	v1 := new(big.Float).Mul(normalized1, price1ETH)
+
+	total := new(big.Float).Add(v0, v1)
+	val, _ := total.Float64()
+	return val
 }

@@ -4,6 +4,8 @@ import (
 	"log"
 	"math/big"
 	"sync"
+
+	"arb-system/backend/redis"
 )
 
 // PoolInfo 保存单个池子信息
@@ -42,21 +44,25 @@ type TokenGraph struct {
 	Pools          map[string]*PoolInfo   // poolAddress -> PoolInfo
 	Tokens         map[string][]*PoolInfo // tokenAddress -> 相关池子
 	mu             sync.RWMutex
-	GasFee         *big.Int              // gas 费用 (wei)
-	EthToToken     map[string]*big.Float // ETH -> token rate，用于换算 gas
-	MaxDepth       int                   // 最大路径长度
-	MaxSlippageBps int                   // 最大滑点 (单位: bps, 100 = 1%)
+	GasFee         *big.Int                   // gas 费用 (wei)
+	EthToToken     map[string]*big.Float      // ETH -> token rate，用于换算 gas
+	MaxDepth       int                        // 最大路径长度
+	MaxSlippageBps int                        // 最大滑点 (单位: bps, 100 = 1%)
+	PendingSwapCh  chan *ArbitrageOpportunity // 套利机会通道
+	AllowedTokens  []string                   // 允许套利的代币地址列表
 }
 
 // NewTokenGraph 创建空 TokenGraph
-func NewTokenGraph(gasFee *big.Int) *TokenGraph {
+func NewTokenGraph(allowedTokens []string) *TokenGraph {
 	return &TokenGraph{
 		Pools:          make(map[string]*PoolInfo),
 		Tokens:         make(map[string][]*PoolInfo),
-		GasFee:         gasFee,
+		GasFee:         big.NewInt(1e15), // 默认 0.001 ETH
 		EthToToken:     make(map[string]*big.Float),
 		MaxDepth:       5,
 		MaxSlippageBps: 200, // 默认 2%
+		PendingSwapCh:  nil, // 需要在初始化时设置
+		AllowedTokens:  allowedTokens,
 	}
 }
 
@@ -87,7 +93,7 @@ func (tg *TokenGraph) UpdatePairIncremental(poolAddr string, reserve0, reserve1 
 
 	startTokens := []string{pool.Token0, pool.Token1}
 	for _, token := range startTokens {
-		go tg.spfa(token)
+		go tg.SPFA(token)
 	}
 }
 
@@ -123,8 +129,8 @@ func (tg *TokenGraph) UpdateEthToTokenRate(token string) {
 	}
 }
 
-// spfa 增量套利检测 + 最优投入量计算
-func (tg *TokenGraph) spfa(startToken string) {
+// SPFA 增量套利检测 + 最优投入量计算
+func (tg *TokenGraph) SPFA(startToken string) {
 	type QueueNode struct {
 		Token     string
 		Path      []*PoolInfo
@@ -188,11 +194,47 @@ func (tg *TokenGraph) spfa(startToken string) {
 		}
 	}
 
+	// 将候选路径存储到Redis中
+	if len(results) > 0 {
+		// 提取路径信息并存储到Redis
+		var paths []string
+		for _, result := range results {
+			// 构造路径字符串
+			var pathStr string
+			for i, pool := range result.Path {
+				if i > 0 {
+					pathStr += ","
+				}
+				pathStr += pool.PoolAddress
+			}
+			paths = append(paths, pathStr)
+		}
+
+		// 存储到Redis
+		err := redis.SetCandidatePaths(startToken, paths)
+		if err != nil {
+			log.Printf("Failed to store candidate paths to Redis: %v", err)
+		} else {
+			log.Printf("Stored %d candidate paths for token %s to Redis", len(paths), startToken)
+		}
+	}
+
 	if len(results) > 0 {
 		log.Printf("SPFA found %d arbitrage opportunities starting from %s", len(results), startToken)
 		for _, arb := range results {
 			log.Printf("Arb path %s, profit: %s wei, amountIn: %s, amountOut: %s",
 				arb.Start, arb.Profit.String(), arb.AmountIn.String(), arb.AmountOut.String())
+
+			// 如果发现利润超过阈值的套利机会，将其发送到执行器通道
+			// 执行器会处理原子合约套利交易
+			if tg.PendingSwapCh != nil {
+				select {
+				case tg.PendingSwapCh <- arb:
+					log.Printf("Sent arbitrage opportunity to executor: %s", arb.Start)
+				default:
+					log.Println("Executor channel full, skipping arbitrage opportunity")
+				}
+			}
 		}
 	}
 }
@@ -263,7 +305,7 @@ func (tg *TokenGraph) calculateOptimalAmount(path []*PoolInfo, maxAmount *big.In
 	for low.Cmp(high) <= 0 {
 		mid := new(big.Int).Add(low, high)
 		mid.Div(mid, big.NewInt(2))
-		amountOut := simulatePath(path, mid, tg.MaxSlippageBps)
+		amountOut := tg.SimulatePath(path, mid, tg.MaxSlippageBps)
 		profit := new(big.Int).Sub(amountOut, mid)
 
 		if profit.Cmp(bestProfit) > 0 {
@@ -282,8 +324,8 @@ func (tg *TokenGraph) calculateOptimalAmount(path []*PoolInfo, maxAmount *big.In
 	return bestIn, bestOut
 }
 
-// simulatePath 模拟整个路径 swap 输出
-func simulatePath(path []*PoolInfo, amountIn *big.Int, maxSlippageBps int) *big.Int {
+// SimulatePath 模拟整个路径 swap 输出（公共接口）
+func (tg *TokenGraph) SimulatePath(path []*PoolInfo, amountIn *big.Int, maxSlippageBps int) *big.Int {
 	amount := new(big.Int).Set(amountIn)
 	tokenIn := path[0].Token0
 	for _, pool := range path {
@@ -295,6 +337,43 @@ func simulatePath(path []*PoolInfo, amountIn *big.Int, maxSlippageBps int) *big.
 		tokenIn = pool.GetOtherToken(tokenIn)
 	}
 	return amount
+}
+
+// CalculateOptimalAmountWithBalance 根据账户余额计算最优套利金额
+func (tg *TokenGraph) CalculateOptimalAmountWithBalance(path []*PoolInfo, maxAmount *big.Int, minProfit *big.Int, balance *big.Int) (*big.Int, *big.Int) {
+	// 如果余额小于最大金额，则使用余额作为上限
+	actualMax := new(big.Int).Set(maxAmount)
+	if balance.Cmp(maxAmount) < 0 {
+		actualMax.Set(balance)
+	}
+
+	// 使用二分法计算最优金额
+	low := big.NewInt(1e12)
+	high := new(big.Int).Set(actualMax)
+	bestIn := new(big.Int)
+	bestProfit := big.NewInt(0)
+	bestOut := new(big.Int)
+
+	for low.Cmp(high) <= 0 {
+		mid := new(big.Int).Add(low, high)
+		mid.Div(mid, big.NewInt(2))
+		amountOut := tg.SimulatePath(path, mid, tg.MaxSlippageBps)
+		profit := new(big.Int).Sub(amountOut, mid)
+
+		if profit.Cmp(bestProfit) > 0 {
+			bestProfit.Set(profit)
+			bestIn.Set(mid)
+			bestOut.Set(amountOut)
+		}
+
+		if profit.Cmp(minProfit) < 0 {
+			low.Add(mid, big.NewInt(1))
+		} else {
+			high.Sub(mid, big.NewInt(1))
+		}
+	}
+
+	return bestIn, bestOut
 }
 
 // calculateMinProfit 根据 start token 自动换算 gas 费用
@@ -310,6 +389,16 @@ func (tg *TokenGraph) calculateMinProfit(startToken string) *big.Int {
 }
 
 // GetPoolsByToken 返回包含 token 的所有池子
+func (tg *TokenGraph) GetPool(poolAddr string) *PoolInfo {
+	tg.mu.RLock()
+	defer tg.mu.RUnlock()
+	pool, ok := tg.Pools[poolAddr]
+	if !ok {
+		return nil
+	}
+	return pool
+}
+
 func (tg *TokenGraph) GetPoolsByToken(token string) []*PoolInfo {
 	tg.mu.RLock()
 	defer tg.mu.RUnlock()
@@ -325,6 +414,35 @@ func (tg *TokenGraph) GetAllPools() []*PoolInfo {
 		pools = append(pools, p)
 	}
 	return pools
+}
+
+// FindArbitrageDFS 从指定 startToken 搜索套利路径
+func (tg *TokenGraph) FindArbitrageDFS(minProfit *big.Int, startToken string) []*ArbitrageOpportunity {
+	// 简化版本，实际应该使用更复杂的算法
+	var results []*ArbitrageOpportunity
+	// 这里应该实现实际的套利检测逻辑
+	return results
+}
+
+// GetPendingSwapCh 获取套利机会通道
+func (tg *TokenGraph) GetPendingSwapCh() chan *ArbitrageOpportunity {
+	tg.mu.RLock()
+	defer tg.mu.RUnlock()
+	return tg.PendingSwapCh
+}
+
+// SetPendingSwapCh 设置套利机会通道
+func (tg *TokenGraph) SetPendingSwapCh(ch chan *ArbitrageOpportunity) {
+	tg.mu.Lock()
+	defer tg.mu.Unlock()
+	tg.PendingSwapCh = ch
+}
+
+// SetExecutor 设置执行器引用
+func (tg *TokenGraph) SetExecutor(executor interface{}) {
+	tg.mu.Lock()
+	defer tg.mu.Unlock()
+	// 这里我们暂时不实现，因为会引入循环依赖
 }
 
 // ---------- 辅助函数 (decimals 统一换算) ----------

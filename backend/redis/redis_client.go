@@ -1,12 +1,16 @@
 package redis
 
 import (
-	"arb-system/backend/resolver"
 	"context"
 	"fmt"
 	"strconv"
 
 	"github.com/redis/go-redis/v9"
+)
+
+var (
+	client *redis.Client
+	ctx    = context.Background()
 )
 
 type Redis struct {
@@ -19,6 +23,20 @@ func NewRedis(addr string, db int) *Redis {
 		DB:   db,
 	})
 	return &Redis{Client: rdb}
+}
+
+func InitRedis(addr string) error {
+	client = redis.NewClient(&redis.Options{
+		Addr:     addr,
+		Password: "",
+		DB:       0,
+		PoolSize: 50, // 高并发池
+	})
+
+	if err := client.Ping(ctx).Err(); err != nil {
+		return fmt.Errorf("Redis connection failed: %v", err)
+	}
+	return nil
 }
 
 // 活跃池子集合
@@ -45,7 +63,15 @@ func (r *Redis) GetReserves(ctx context.Context, pool string) (map[string]string
 	key := fmt.Sprintf("pool:%s:reserves", pool)
 	return r.Client.HGetAll(ctx, key).Result()
 }
-func SetTokenMeta(addr string, meta *resolver.TokenMeta) {
+
+type TokenMeta struct {
+	Address  string
+	Symbol   string
+	Name     string
+	Decimals uint8
+}
+
+func SetTokenMeta(addr string, meta *TokenMeta) {
 	key := "tokenmeta:" + addr
 	client.HSet(ctx, key, map[string]interface{}{
 		"symbol":   meta.Symbol,
@@ -54,14 +80,14 @@ func SetTokenMeta(addr string, meta *resolver.TokenMeta) {
 	})
 }
 
-func GetTokenMeta(addr string) *resolver.TokenMeta {
+func GetTokenMeta(addr string) *TokenMeta {
 	key := "tokenmeta:" + addr
 	data, err := client.HGetAll(ctx, key).Result()
 	if err != nil || len(data) == 0 {
 		return nil
 	}
 	decimals, _ := strconv.Atoi(data["decimals"])
-	return &resolver.TokenMeta{
+	return &TokenMeta{
 		Address:  addr,
 		Symbol:   data["symbol"],
 		Name:     data["name"],

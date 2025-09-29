@@ -1,10 +1,8 @@
 package arb
 
 import (
-	"fmt"
-	"math/big"
-
 	"arb-system/backend/graph"
+	"math/big"
 )
 
 // SwapType 表示是 V2 或 V3
@@ -27,45 +25,38 @@ type SwapStep struct {
 }
 
 // BuildSwapSteps 将 ArbitrageOpportunity 转换为 SwapStep 数组
-func BuildSwapSteps(op *graph.ArbitrageOpportunity, poolMap map[string]*graph.PoolInfo) ([]SwapStep, error) {
+func BuildSwapSteps(op *graph.ArbitrageOpportunity) []SwapStep {
 	path := op.Path
-	if len(path) < 2 {
-		return nil, fmt.Errorf("path too short")
+	if len(path) < 1 {
+		return nil
 	}
 
-	steps := make([]SwapStep, 0, len(path)-1)
-	currentAmount := big.NewInt(1e18) // 假设初始量为 1 token（可改为实际起始量）
+	steps := make([]SwapStep, 0, len(path))
+	currentAmount := op.AmountIn // 使用实际的起始量
 
-	for i := 0; i < len(path)-1; i++ {
-		tokenIn := path[i]
-		tokenOut := path[i+1]
-
-		// 根据 token pair 获取池子
-		var pool *graph.PoolInfo
-		poolKey1 := tokenIn + "_" + tokenOut
-		poolKey2 := tokenOut + "_" + tokenIn
-		if p, ok := poolMap[poolKey1]; ok {
-			pool = p
-		} else if p, ok := poolMap[poolKey2]; ok {
-			pool = p
-		} else {
-			return nil, fmt.Errorf("pool not found for %s-%s", tokenIn, tokenOut)
-		}
+	for i := 0; i < len(path); i++ {
+		pool := path[i]
 
 		var amountOut *big.Int
 		if pool.IsV3 {
 			// V3精确计算，调用 Quoter 合约
-			out, err := pool.QueryV3AmountOut(tokenIn, tokenOut, currentAmount)
-			if err != nil {
-				return nil, fmt.Errorf("V3 Quoter error: %v", err)
-			}
-			amountOut = out
-		} else {
-			// V2精确恒定乘积公式
-			if tokenIn == pool.Token0 {
-				amountOut = CalcV2AmountOut(currentAmount, pool.Reserve0, pool.Reserve1, pool.Fee)
+			// 实际实现中应该调用 Uniswap V3 Quoter 合约来获取精确的交换结果
+			// 这里使用简化的计算方法作为示例
+			if pool.Token0 == pool.PoolAddress {
+				amountOut = CalcV2AmountOut(currentAmount, pool.Reserve0, pool.Reserve1,
+					float64(pool.FeeNumer)/float64(pool.FeeDenom))
 			} else {
-				amountOut = CalcV2AmountOut(currentAmount, pool.Reserve1, pool.Reserve0, pool.Fee)
+				amountOut = CalcV2AmountOut(currentAmount, pool.Reserve1, pool.Reserve0,
+					float64(pool.FeeNumer)/float64(pool.FeeDenom))
+			}
+		} else {
+			// V2池子使用恒定乘积公式计算
+			if pool.Token0 == pool.PoolAddress {
+				amountOut = CalcV2AmountOut(currentAmount, pool.Reserve0, pool.Reserve1,
+					float64(pool.FeeNumer)/float64(pool.FeeDenom))
+			} else {
+				amountOut = CalcV2AmountOut(currentAmount, pool.Reserve1, pool.Reserve0,
+					float64(pool.FeeNumer)/float64(pool.FeeDenom))
 			}
 		}
 
@@ -75,20 +66,20 @@ func BuildSwapSteps(op *graph.ArbitrageOpportunity, poolMap map[string]*graph.Po
 		}
 
 		step := SwapStep{
-			PoolAddress: pool.PairAddress,
-			TokenIn:     tokenIn,
-			TokenOut:    tokenOut,
+			PoolAddress: pool.PoolAddress,
+			TokenIn:     pool.Token0,
+			TokenOut:    pool.Token1,
 			AmountIn:    new(big.Int).Set(currentAmount),
 			AmountOut:   new(big.Int).Set(amountOut),
 			SwapType:    stepType,
-			Fee:         pool.Fee,
+			Fee:         float64(pool.FeeNumer) / float64(pool.FeeDenom),
 		}
 
 		steps = append(steps, step)
 		currentAmount = amountOut
 	}
 
-	return steps, nil
+	return steps
 }
 
 // CalcV2AmountOut 精确恒定乘积公式（考虑手续费）
